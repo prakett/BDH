@@ -22,7 +22,7 @@ NUM_LAYERS = 4
 SEQ_LEN = 256
 
 # 6 GB VRAM: use 8 instead of 16.
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 
 TOTAL_STEPS = 10000
 
