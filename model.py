@@ -1,486 +1,212 @@
+import math
+import os
+import time
+
 import torch
-import torch.nn as nn
+import torch.distributed as dist
 import torch.nn.functional as F
+from datasets import load_dataset
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-# ============================================================
-# Configuration
-# ============================================================
+from model import BDHModel, count_parameters
 
-N = 32768
-D = 256
-NUM_HEADS = 4
-NUM_LAYERS = 4
-DROPOUT = 0.05
-VOCAB_SIZE = 256
+N, D = 32768, 256
+NUM_HEADS, NUM_LAYERS = 4, 4
+SEQ_LEN = 128
+BATCH_SIZE_PER_GPU = 8
+TOTAL_STEPS = 10000
+LR_START, LR_END = 1e-3, 1e-4
+WARMUP_STEPS = 1000
+WEIGHT_DECAY = 0.1
+PRINT_EVERY = 10
+SAVE_PATH = "bdh_model_ddp.pt"
+DATASET_NAME = "roneneldan/TinyStories"
 
-
-# ============================================================
-# RoPE
-# ============================================================
-
-def apply_rope(x):
-    """
-    x:
-        [B, H, T, D_head]
-
-    Returns:
-        [B, H, T, D_head]
-    """
-
-    B, H, T, Dh = x.shape
-
-    if Dh % 2 != 0:
-        raise ValueError(
-            f"RoPE requires an even head dimension, got {Dh}"
-        )
-
-    device = x.device
-    dtype = x.dtype
-
-    half = Dh // 2
-
-    positions = torch.arange(
-        T,
-        device=device,
-        dtype=torch.float32,
-    )
-
-    inv_freq = 1.0 / (
-        10000.0 ** (
-            torch.arange(
-                0,
-                half,
-                device=device,
-                dtype=torch.float32,
-            ) / half
-        )
-    )
-
-    angles = torch.outer(positions, inv_freq)
-
-    cos = torch.cos(angles).to(dtype)
-    sin = torch.sin(angles).to(dtype)
-
-    cos = cos.unsqueeze(0).unsqueeze(0)
-    sin = sin.unsqueeze(0).unsqueeze(0)
-
-    x1 = x[..., :half]
-    x2 = x[..., half:]
-
-    return torch.cat(
-        [
-            x1 * cos - x2 * sin,
-            x1 * sin + x2 * cos,
-        ],
-        dim=-1,
-    )
+# Stable-training adaptive clipping settings used in the 10k run.
+ZCLIP_ALPHA = 0.97
+ZCLIP_Z_THRESHOLD = 2.5
+ZCLIP_MAX_GRAD_NORM = 1.0
+ZCLIP_EPS = 1e-6
+ZCLIP_WARMUP_STEPS = 25
 
 
-# ============================================================
-# Linear Attention
-# ============================================================
+def setup():
+    if "RANK" not in os.environ:
+        raise RuntimeError("Launch with: torchrun --standalone --nproc_per_node=2 train.py")
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group("nccl")
+    return rank, local_rank, world
 
-class LinearAttention(nn.Module):
+
+rank, local_rank, world = setup()
+device = torch.device("cuda", local_rank)
+is_main = rank == 0
+
+# Performance settings; these do not change the BDH equations.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
+
+def log(*args, **kwargs):
+    if is_main:
+        print(*args, **kwargs)
+
+
+log("=" * 72)
+log("BDH-GPU - 2x GPU DistributedDataParallel")
+log("=" * 72)
+log(f"World size: {world}")
+log(f"GPU: {torch.cuda.get_device_name(local_rank)}")
+log(f"Per-GPU batch: {BATCH_SIZE_PER_GPU}")
+log(f"Effective batch: {BATCH_SIZE_PER_GPU * world}")
+log(f"N={N}, D={D}, heads={NUM_HEADS}, layers={NUM_LAYERS}, seq={SEQ_LEN}")
+
+model = BDHModel(n=N, d=D, num_heads=NUM_HEADS, num_layers=NUM_LAYERS).to(device)
+log(f"Parameters: {count_parameters(model):,}")
+model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+            broadcast_buffers=False, find_unused_parameters=False)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR_START, weight_decay=WEIGHT_DECAY)
+
+
+class AdaptiveZClip:
     def __init__(self):
-        super().__init__()
-
-    def forward(self, Q, K, V, debug=False):
-        # Appendix-E-style raw attention.
-        # No 1/sqrt(d) scaling and no softmax.
-        Q = Q.float()
-        K = K.float()
-        V = V.float()
-
-        Qr = apply_rope(Q)
-        Kr = apply_rope(K)
-
-        scores = Qr @ Kr.transpose(-1, -2)
-
-        # Causal attention: current token cannot attend to itself
-        # or future tokens.
-        scores = torch.tril(
-            scores,
-            diagonal=-1,
-        )
-
-        output = scores @ V
-
-        if debug:
-            def stats(name, x):
-                print(
-                    f"[ATTN] {name}: "
-                    f"min={x.min().item():.4e}, "
-                    f"max={x.max().item():.4e}, "
-                    f"mean={x.mean().item():.4e}, "
-                    f"std={x.std().item():.4e}, "
-                    f"finite={torch.isfinite(x).all().item()}"
-                )
-
-            stats("Q", Qr)
-            stats("K", Kr)
-            stats("V", V)
-            stats("scores", scores)
-            stats("output", output)
-
-        if not torch.isfinite(output).all():
-            raise FloatingPointError(
-                "Non-finite values detected in LinearAttention output"
-            )
-
-        return output
-
-
-# ============================================================
-# BDH-GPU
-# ============================================================
-
-class BDHModel(nn.Module):
-
-    def __init__(
-        self,
-        n=N,
-        d=D,
-        num_heads=NUM_HEADS,
-        num_layers=NUM_LAYERS,
-        dropout=DROPOUT,
-        vocab_size=VOCAB_SIZE,
-    ):
-        super().__init__()
-
-        if n % num_heads != 0:
-            raise ValueError(
-                f"N={n} must be divisible by num_heads={num_heads}"
-            )
-
-        self.n = n
-        self.d = d
-        self.num_heads = num_heads
-        self.num_layers = num_layers
-        self.dropout_rate = dropout
-        self.vocab_size = vocab_size
-
-        # ----------------------------------------------------
-        # LayerNorm
-        # ----------------------------------------------------
-
-        self.ln = nn.LayerNorm(
-            d,
-            elementwise_affine=False,
-            bias=False,
-        )
-
-        # ----------------------------------------------------
-        # Byte embedding
-        # ----------------------------------------------------
-
-        self.wte = nn.Embedding(
-            vocab_size,
-            d,
-        )
-
-        self.drop = nn.Dropout(dropout)
-
-        # ----------------------------------------------------
-        # BDH-GPU parameters
-        #
-        # encoder:
-        #     [N, D]
-        #
-        # decoder_x:
-        #     [H, D, N/H]
-        #
-        # decoder_y:
-        #     [H, D, N/H]
-        # ----------------------------------------------------
-
-        self.encoder = nn.Parameter(
-            torch.zeros(n, d).normal_(std=0.02)
-        )
-
-        self.decoder_x = nn.Parameter(
-            torch.zeros(
-                num_heads,
-                d,
-                n // num_heads,
-            ).normal_(std=0.02)
-        )
-
-        self.decoder_y = nn.Parameter(
-            torch.zeros(
-                num_heads,
-                d,
-                n // num_heads,
-            ).normal_(std=0.02)
-        )
-
-        # ----------------------------------------------------
-        # Final vocabulary readout
-        # ----------------------------------------------------
-
-        self.readout = nn.Parameter(
-            torch.zeros(
-                d,
-                vocab_size,
-            ).normal_(std=0.02)
-        )
-
-        self.attn = LinearAttention()
-
-    # ========================================================
-    # Finite check helper
-    # ========================================================
-
-    @staticmethod
-    def check_finite(x, name):
-        if not torch.isfinite(x).all():
-            finite_ratio = (
-                torch.isfinite(x).float().mean().item()
-            )
-
-            x_abs = x.detach().float().abs()
-            finite_values = x_abs[
-                torch.isfinite(x_abs)
-            ]
-
-            if finite_values.numel() > 0:
-                max_value = finite_values.max().item()
-            else:
-                max_value = float("nan")
-
-            raise FloatingPointError(
-                f"Non-finite tensor detected: {name} | "
-                f"finite={finite_ratio:.6f} | "
-                f"max_abs={max_value:.6e}"
-            )
-
-    # ========================================================
-    # Forward
-    # ========================================================
-
-    def forward(self, idx, debug=False):
-
-        B, T = idx.size()
-
-        # ----------------------------------------------------
-        # Token embedding
-        # ----------------------------------------------------
-
-        v_ast = self.wte(idx)
-
-        if debug:
-            self.check_finite(
-                v_ast,
-                "embedding",
-            )
-
-        # [B, 1, T, D]
-        v_ast = v_ast.unsqueeze(1)
-        v_ast = self.ln(v_ast)
-
-        if debug:
-            self.check_finite(
-                v_ast,
-                "initial_layernorm",
-            )
-
-        # ----------------------------------------------------
-        # BDH layers
-        # ----------------------------------------------------
-
-        for layer_idx in range(self.num_layers):
-
-            # X projection
-            x = torch.matmul(
-                v_ast,
-                self.decoder_x,
-            )
-
-            if debug:
-                self.check_finite(
-                    x,
-                    f"layer_{layer_idx}_decoder_x",
-                )
-
-            x = F.relu(x)
-
-            if debug:
-                self.check_finite(
-                    x,
-                    f"layer_{layer_idx}_relu_x",
-                )
-
-            # Linear attention
-            a_ast = self.attn(
-                Q=x,
-                K=x,
-                V=v_ast,
-                debug=debug,
-            )
-
-            if debug:
-                self.check_finite(
-                    a_ast,
-                    f"layer_{layer_idx}_attention",
-                )
-
-            # Attention normalization
-            a_ast = self.ln(a_ast)
-
-            if debug:
-                self.check_finite(
-                    a_ast,
-                    f"layer_{layer_idx}_attention_norm",
-                )
-
-            # Y projection
-            y = torch.matmul(
-                a_ast,
-                self.decoder_y,
-            )
-
-            if debug:
-                self.check_finite(
-                    y,
-                    f"layer_{layer_idx}_decoder_y",
-                )
-
-            y = F.relu(y)
-
-            if debug:
-                self.check_finite(
-                    y,
-                    f"layer_{layer_idx}_relu_y",
-                )
-
-            # Multiplicative interaction
-            y = y * x
-
-            if debug:
-                self.check_finite(
-                    y,
-                    f"layer_{layer_idx}_y_times_x",
-                )
-
-            # Reshape back to neuron dimension N
-            y = y.transpose(1, 2)
-
-            y = y.reshape(
-                B,
-                1,
-                T,
-                self.n,
-            )
-
-            if debug:
-                self.check_finite(
-                    y,
-                    f"layer_{layer_idx}_reshape",
-                )
-
-            # Dropout
-            y = self.drop(y)
-
-            # Encoder projection
-            update = torch.matmul(
-                y,
-                self.encoder,
-            )
-
-            if debug:
-                self.check_finite(
-                    update,
-                    f"layer_{layer_idx}_encoder_update",
-                )
-
-            # Residual update
-            v_ast = v_ast + self.ln(update)
-
-            if debug:
-                self.check_finite(
-                    v_ast,
-                    f"layer_{layer_idx}_residual",
-                )
-
-            v_ast = self.ln(v_ast)
-
-            if debug:
-                self.check_finite(
-                    v_ast,
-                    f"layer_{layer_idx}_final_norm",
-                )
-
-        # ----------------------------------------------------
-        # Readout
-        # ----------------------------------------------------
-
-        hidden = v_ast.squeeze(1)
-
-        logits = torch.matmul(
-            hidden,
-            self.readout,
-        )
-
-        if debug:
-            self.check_finite(
-                logits,
-                "logits",
-            )
-
-        return logits
-
-
-# ============================================================
-# Parameter counter
-# ============================================================
-
-def count_parameters(model):
-    return sum(
-        p.numel()
-        for p in model.parameters()
-        if p.requires_grad
-    )
-
-
-# ============================================================
-# Test
-# ============================================================
-
-if __name__ == "__main__":
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    model = BDHModel().to(device)
-
-    print("=" * 60)
-    print("BDH-GPU MODEL")
-    print("=" * 60)
-
-    print(f"N:          {model.n}")
-    print(f"D:          {model.d}")
-    print(f"Heads:      {model.num_heads}")
-    print(f"Layers:     {model.num_layers}")
-
-    print(
-        f"Parameters: "
-        f"{count_parameters(model):,}"
-    )
-
-    x = torch.randint(
-        0,
-        VOCAB_SIZE,
-        (2, 128),
-        device=device,
-    )
-
-    logits = model(
-        x,
-        debug=True,
-    )
-
-    print(
-        "Output:",
-        logits.shape,
-        logits.dtype,
-    )
-
-    print("Forward pass successful.")
+        self.mean = None
+        self.var = 0.0
+        self.steps = 0
+
+    @torch.no_grad()
+    def clip(self, parameters, norm):
+        self.steps += 1
+        if self.mean is None:
+            self.mean = norm
+        else:
+            delta = norm - self.mean
+            self.mean = ZCLIP_ALPHA * self.mean + (1 - ZCLIP_ALPHA) * norm
+            self.var = ZCLIP_ALPHA * self.var + (1 - ZCLIP_ALPHA) * delta * delta
+        std = math.sqrt(max(self.var, 0.0) + ZCLIP_EPS)
+        z = (norm - self.mean) / std
+        do_clip = self.steps <= ZCLIP_WARMUP_STEPS or z > ZCLIP_Z_THRESHOLD
+        if do_clip:
+            torch.nn.utils.clip_grad_norm_(parameters, ZCLIP_MAX_GRAD_NORM)
+        return z, do_clip
+
+
+zclip = AdaptiveZClip()
+
+log("Loading TinyStories...")
+dataset = load_dataset(DATASET_NAME)
+train_dataset = dataset["train"]
+log(f"Training examples: {len(train_dataset):,}")
+
+
+def story_bytes(story):
+    text = story.get("text", "") if isinstance(story, dict) else str(story)
+    return text.encode("utf-8", errors="replace")
+
+
+def batch_generator():
+    buffers = [bytearray() for _ in range(BATCH_SIZE_PER_GPU)]
+    story_index = rank * BATCH_SIZE_PER_GPU
+    stride = world * BATCH_SIZE_PER_GPU
+    while True:
+        for i in range(BATCH_SIZE_PER_GPU):
+            while len(buffers[i]) < SEQ_LEN + 1:
+                buffers[i].extend(story_bytes(train_dataset[story_index % len(train_dataset)]))
+                buffers[i].append(10)
+                story_index += stride
+        rows = []
+        for i in range(BATCH_SIZE_PER_GPU):
+            chunk = buffers[i][:SEQ_LEN + 1]
+            del buffers[i][:SEQ_LEN]
+            rows.append(list(chunk))
+        x = torch.tensor([r[:-1] for r in rows], dtype=torch.long, device=device)
+        y = torch.tensor([r[1:] for r in rows], dtype=torch.long, device=device)
+        yield x, y
+
+
+def grad_norm():
+    total = 0.0
+    for p in model.module.parameters():
+        if p.grad is None:
+            continue
+        if not torch.isfinite(p.grad).all():
+            return None
+        n = p.grad.detach().float().norm(2).item()
+        total += n * n
+    return math.sqrt(total)
+
+
+def set_lr(step):
+    if step <= WARMUP_STEPS:
+        lr = LR_START * step / WARMUP_STEPS
+    else:
+        progress = min(1.0, (step - WARMUP_STEPS) / max(1, TOTAL_STEPS - WARMUP_STEPS))
+        lr = LR_START + (LR_END - LR_START) * progress
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+    return lr
+
+
+def vram():
+    a = torch.cuda.memory_allocated(device) / 1024**3
+    r = torch.cuda.memory_reserved(device) / 1024**3
+    t = torch.cuda.get_device_properties(device).total_memory / 1024**3
+    print(f"VRAM {a:.2f}/{t:.2f} GB (reserved {r:.2f} GB)")
+
+
+loader = batch_generator()
+model.train()
+dist.barrier()
+start = last_log = time.perf_counter()
+last_step = 0
+
+try:
+    for step in range(1, TOTAL_STEPS + 1):
+        last_step = step
+        lr = set_lr(step)
+        x, targets = next(loader)
+        optimizer.zero_grad(set_to_none=True)
+
+        # FP32 intentionally retained for the first DDP benchmark.
+        logits = model(x)
+        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"Non-finite loss at step {step}: {loss.item()}")
+
+        loss.backward()
+        gn = grad_norm()
+        if gn is None:
+            raise FloatingPointError(f"Non-finite gradient at step {step}")
+        z, clipped = zclip.clip(model.module.parameters(), gn)
+        optimizer.step()
+
+        if step % PRINT_EVERY == 0 and is_main:
+            now = time.perf_counter()
+            sps = PRINT_EVERY / max(now - last_log, 1e-9)
+            last_log = now
+            lv = loss.item()
+            print(f"Step {step:5d} | LR {lr:.7f} | Loss {lv:.4f} | PPL {math.exp(min(lv,20)):.2f} | GradNorm {gn:.4f} | Z {z:.2f} | Clip {clipped} | {sps:.2f} step/s | ", end="")
+            vram()
+
+    dist.barrier()
+    if is_main:
+        torch.save({
+            "model_state_dict": model.module.state_dict(),
+            "n": N, "d": D, "num_heads": NUM_HEADS, "num_layers": NUM_LAYERS,
+            "seq_len": SEQ_LEN, "vocab_size": 256,
+            "learning_rate_start": LR_START, "learning_rate_end": LR_END,
+            "warmup_steps": WARMUP_STEPS, "weight_decay": WEIGHT_DECAY,
+            "step": last_step, "world_size": world,
+            "batch_size_per_gpu": BATCH_SIZE_PER_GPU,
+            "effective_batch_size": BATCH_SIZE_PER_GPU * world,
+        }, SAVE_PATH)
+        print(f"Checkpoint saved: {SAVE_PATH}")
+        print(f"Elapsed: {(time.perf_counter() - start)/60:.2f} min")
+finally:
+    if dist.is_initialized():
+        dist.destroy_process_group()
