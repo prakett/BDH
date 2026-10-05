@@ -10,6 +10,7 @@ from model import (
     count_parameters,
 )
 
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -25,48 +26,36 @@ DROPOUT = 0.10
 VOCAB_SIZE = 256
 
 # ------------------------------------------------------------
-# Paper uses 2048-token minibatches.
-#
-# With 25M BDH and 14-16 GB GPUs, start with batch=1.
+# Paper scaling setup
 # ------------------------------------------------------------
 
 SEQ_LEN = 2048
-BATCH_SIZE = 1
 
-# ------------------------------------------------------------
-# Number of optimization steps.
+# 1 example x 2048 tokens.
 #
-# Keep this configurable. The paper's large experiments use
-# much larger token exposure; this is a practical first run.
+# This is the safe starting point for a single 16 GB T4
+# or similar GPU.
+#
+# The recurrent state is carried across minibatches.
 # ------------------------------------------------------------
+
+BATCH_SIZE = 1
 
 TOTAL_STEPS = 10000
 
-# ------------------------------------------------------------
-# Paper training schedule
-# ------------------------------------------------------------
-
-LR_START = 1e-3
-LR_END = 1e-4
+LEARNING_RATE = 1e-3
+MIN_LEARNING_RATE = 1e-4
 
 WARMUP_STEPS = 1000
 
 WEIGHT_DECAY = 0.1
-
-# Gradient clipping.
-#
-# The paper specifies adaptive gradient clipping. We keep
-# a conservative finite global clip here for this first
-# implementation rather than silently inventing a different
-# adaptive-clipping algorithm.
-# ------------------------------------------------------------
 
 GRAD_CLIP = 1.0
 
 PRINT_EVERY = 10
 
 SAVE_PATH = (
-    "bdh_tinystories_25m_2048.pt"
+    "bdh_tinystories_25m_stateful.pt"
 )
 
 DATASET_NAME = (
@@ -84,49 +73,38 @@ DEVICE = torch.device(
     else "cpu"
 )
 
-print(
-    "=" * 72
-)
+
+print("=" * 70)
+print("BDH-GPU 25M TINYSTORIES TRAINING")
+print("=" * 70)
 
 print(
-    "BDH-GPU 25M TINYSTORIES TRAINING"
-)
-
-print(
-    "Paper-aligned 8-layer / 2048-token / TBPTT setup"
-)
-
-print(
-    "=" * 72
-)
-
-print(
-    f"Device: {DEVICE}"
+    f"Device:       {DEVICE}"
 )
 
 if DEVICE.type == "cuda":
 
     print(
-        f"GPU: "
+        f"GPU:          "
         f"{torch.cuda.get_device_name(0)}"
     )
 
     print(
-        f"CUDA: "
+        f"CUDA:         "
         f"{torch.version.cuda}"
     )
 
     print(
-        f"VRAM: "
+        f"VRAM total:   "
         f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB"
     )
 
+    # --------------------------------------------------------
+    # TF32 for large matrix multiplications.
+    # --------------------------------------------------------
+
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-
-    torch.set_float32_matmul_precision(
-        "high"
-    )
 
 
 # ============================================================
@@ -140,12 +118,15 @@ model = BDHModel(
     num_layers=NUM_LAYERS,
     dropout=DROPOUT,
     vocab_size=VOCAB_SIZE,
-).to(
-    DEVICE
+).to(DEVICE)
+
+
+parameter_count = count_parameters(
+    model
 )
 
-print()
 
+print()
 print(
     f"N:              {N}"
 )
@@ -163,41 +144,27 @@ print(
 )
 
 print(
+    f"Sequence:        {SEQ_LEN}"
+)
+
+print(
+    f"Batch:           {BATCH_SIZE}"
+)
+
+print(
     f"Dropout:         {DROPOUT}"
 )
 
 print(
-    f"Sequence length: {SEQ_LEN}"
-)
-
-print(
-    f"Batch size:      {BATCH_SIZE}"
-)
-
-print(
     f"Parameters:      "
-    f"{count_parameters(model):,}"
+    f"{parameter_count:,}"
 )
 
-expected_parameters = 25296896
-
-if count_parameters(model) != expected_parameters:
-
-    print()
+if parameter_count != 25_296_896:
 
     print(
-        "WARNING:"
-    )
-
-    print(
-        f"Expected approximately "
-        f"{expected_parameters:,} parameters "
-        f"for this configuration."
-    )
-
-    print(
-        f"Actual: "
-        f"{count_parameters(model):,}"
+        "WARNING: parameter count differs "
+        "from the expected 25M configuration."
     )
 
 
@@ -207,7 +174,7 @@ if count_parameters(model) != expected_parameters:
 
 optimizer = torch.optim.AdamW(
     model.parameters(),
-    lr=LR_START,
+    lr=LEARNING_RATE,
     weight_decay=WEIGHT_DECAY,
 )
 
@@ -217,13 +184,12 @@ optimizer = torch.optim.AdamW(
 # ============================================================
 
 print()
-
 print(
     "Loading TinyStories..."
 )
 
 dataset = load_dataset(
-    DATASET_NAME
+    DATASET_NAME,
 )
 
 train_dataset = dataset[
@@ -237,231 +203,320 @@ print(
 
 
 # ============================================================
-# BUILD RAW UTF-8 BYTE CORPUS
+# STORY -> UTF-8 BYTES
 # ============================================================
 
-print()
-
-print(
-    "Building TinyStories byte corpus..."
-)
-
-corpus = bytearray()
-
-for example in train_dataset:
-
-    text = example[
-        "text"
-    ]
-
-    if not text:
-        continue
-
-    encoded = text.encode(
-        "utf-8",
-        errors="replace",
-    )
-
-    corpus.extend(
-        encoded
-    )
-
-    # Separate stories.
-    corpus.append(
-        10
-    )
-
-
-corpus = bytes(
-    corpus
-)
-
-print(
-    f"Corpus size: "
-    f"{len(corpus):,} bytes"
-)
-
-
-if len(corpus) <= (
-    SEQ_LEN + 1
+def story_to_bytes(
+    story
 ):
 
-    raise RuntimeError(
-        "Corpus is too small "
-        "for the selected sequence length."
-    )
+    if isinstance(
+        story,
+        dict,
+    ):
 
-
-# ============================================================
-# SEQUENTIAL DATA GENERATOR
-# ============================================================
-#
-# IMPORTANT:
-#
-# We intentionally do NOT randomly sample independent
-# 2048-token chunks.
-#
-# The recurrent state is carried from one minibatch to the
-# next, so the data must also be temporally sequential.
-#
-# This gives:
-#
-# chunk 1 -> state 1
-# chunk 2 -> state 2
-# chunk 3 -> state 3
-#
-# ============================================================
-
-def batch_generator():
-
-    position = 0
-
-    corpus_length = len(
-        corpus
-    )
-
-    while True:
-
-        batch_x = []
-        batch_y = []
-
-        for _ in range(
-            BATCH_SIZE
-        ):
-
-            # ------------------------------------------------
-            # Wrap around corpus.
-            # ------------------------------------------------
-
-            if (
-                position
-                + SEQ_LEN
-                + 1
-                > corpus_length
-            ):
-
-                position = 0
-
-            chunk = corpus[
-                position:
-                position
-                + SEQ_LEN
-                + 1
-            ]
-
-            x = torch.tensor(
-                list(
-                    chunk[:-1]
-                ),
-                dtype=torch.long,
-            )
-
-            y = torch.tensor(
-                list(
-                    chunk[1:]
-                ),
-                dtype=torch.long,
-            )
-
-            batch_x.append(
-                x
-            )
-
-            batch_y.append(
-                y
-            )
-
-            position += (
-                SEQ_LEN
-            )
-
-        x = torch.stack(
-            batch_x
-        ).to(
-            DEVICE
-        )
-
-        y = torch.stack(
-            batch_y
-        ).to(
-            DEVICE
-        )
-
-        yield x, y
-
-
-# ============================================================
-# LEARNING RATE SCHEDULE
-# ============================================================
-
-def set_lr(step):
-
-    if step <= WARMUP_STEPS:
-
-        lr = (
-            LR_START
-            * step
-            / WARMUP_STEPS
+        text = story.get(
+            "text",
+            "",
         )
 
     else:
 
-        progress = min(
-            1.0,
-            (
-                step
-                - WARMUP_STEPS
-            )
-            / max(
-                1,
-                TOTAL_STEPS
-                - WARMUP_STEPS,
-            ),
+        text = str(
+            story
         )
 
-        lr = (
-            LR_START
-            + (
-                LR_END
-                - LR_START
-            )
-            * progress
+    return text.encode(
+        "utf-8",
+        errors="replace",
+    )
+
+
+# ============================================================
+# CONTINUOUS BYTE STREAM
+# ============================================================
+
+def build_training_stream():
+
+    stream = bytearray()
+
+    print(
+        "Building TinyStories UTF-8 "
+        "training stream..."
+    )
+
+    for i in range(
+        len(train_dataset)
+    ):
+
+        story = train_dataset[i]
+
+        data = story_to_bytes(
+            story
         )
+
+        if len(data) == 0:
+            continue
+
+        stream.extend(
+            data
+        )
+
+        # Separate stories.
+        stream.append(
+            10
+        )
+
+        if (
+            (i + 1) % 100000
+            == 0
+        ):
+
+            print(
+                f"Processed "
+                f"{i + 1:,} stories"
+            )
+
+    return stream
+
+
+training_stream = (
+    build_training_stream()
+)
+
+print(
+    f"Training bytes: "
+    f"{len(training_stream):,}"
+)
+
+
+# ============================================================
+# STREAM POSITION
+# ============================================================
+
+stream_position = 0
+
+
+def get_batch():
+
+    global stream_position
+
+    stream_length = len(
+        training_stream
+    )
+
+    inputs = []
+    targets = []
+
+    for _ in range(
+        BATCH_SIZE
+    ):
+
+        # ----------------------------------------------------
+        # If there isn't enough data remaining, restart the
+        # stream.
+        #
+        # The state is reset by the training loop when this
+        # happens because the temporal stream has wrapped.
+        # ----------------------------------------------------
+
+        if (
+            stream_position
+            + SEQ_LEN
+            + 1
+            > stream_length
+        ):
+
+            stream_position = 0
+
+        chunk = training_stream[
+            stream_position:
+            stream_position
+            + SEQ_LEN
+            + 1
+        ]
+
+        if len(chunk) < (
+            SEQ_LEN + 1
+        ):
+
+            stream_position = 0
+
+            chunk = training_stream[
+                :SEQ_LEN + 1
+            ]
+
+        x = list(
+            chunk[:-1]
+        )
+
+        y = list(
+            chunk[1:]
+        )
+
+        inputs.append(
+            x
+        )
+
+        targets.append(
+            y
+        )
+
+        stream_position += (
+            SEQ_LEN
+        )
+
+    x = torch.tensor(
+        inputs,
+        dtype=torch.long,
+        device=DEVICE,
+    )
+
+    y = torch.tensor(
+        targets,
+        dtype=torch.long,
+        device=DEVICE,
+    )
+
+    return x, y
+
+
+# ============================================================
+# LEARNING RATE
+# ============================================================
+
+def get_learning_rate(
+    step
+):
+
+    # --------------------------------------------------------
+    # Linear warmup:
+    #
+    # 0 -> 1e-3 over 1000 steps
+    # --------------------------------------------------------
+
+    if step <= WARMUP_STEPS:
+
+        return (
+            LEARNING_RATE
+            * step
+            / WARMUP_STEPS
+        )
+
+    # --------------------------------------------------------
+    # Linear decay:
+    #
+    # 1e-3 -> 1e-4
+    # --------------------------------------------------------
+
+    decay_steps = (
+        TOTAL_STEPS
+        - WARMUP_STEPS
+    )
+
+    progress = (
+        step
+        - WARMUP_STEPS
+    ) / decay_steps
+
+    progress = max(
+        0.0,
+        min(
+            1.0,
+            progress,
+        ),
+    )
+
+    return (
+        LEARNING_RATE
+        + progress
+        * (
+            MIN_LEARNING_RATE
+            - LEARNING_RATE
+        )
+    )
+
+
+def set_learning_rate(
+    lr
+):
 
     for group in (
         optimizer.param_groups
     ):
 
-        group[
-            "lr"
-        ] = lr
-
-    return lr
+        group["lr"] = lr
 
 
 # ============================================================
-# STATE DETACH
-# ============================================================
-#
-# This is the TBPTT boundary.
-#
-# The recurrent state is preserved numerically, but its
-# previous computation graph is detached before the next
-# 2048-token minibatch.
-#
+# GRADIENT CHECK
 # ============================================================
 
-def detach_states(
-    states
-):
+def check_gradients():
 
-    if states is None:
-        return None
+    total_norm_sq = 0.0
 
-    return [
-        state.detach()
-        for state in states
-    ]
+    for name, parameter in (
+        model.named_parameters()
+    ):
+
+        if parameter.grad is None:
+            continue
+
+        if not torch.isfinite(
+            parameter.grad
+        ).all():
+
+            return (
+                False,
+                name,
+                None,
+            )
+
+        norm = (
+            parameter.grad
+            .detach()
+            .float()
+            .norm(2)
+            .item()
+        )
+
+        total_norm_sq += (
+            norm ** 2
+        )
+
+    return (
+        True,
+        None,
+        math.sqrt(
+            total_norm_sq
+        ),
+    )
+
+
+# ============================================================
+# PARAMETER CHECK
+# ============================================================
+
+def check_parameters():
+
+    for name, parameter in (
+        model.named_parameters()
+    ):
+
+        if not torch.isfinite(
+            parameter
+        ).all():
+
+            return (
+                False,
+                name,
+            )
+
+    return (
+        True,
+        None,
+    )
 
 
 # ============================================================
@@ -485,9 +540,7 @@ def print_vram():
 
     total = (
         torch.cuda
-        .get_device_properties(
-            DEVICE
-        )
+        .get_device_properties(0)
         .total_memory
         / 1024**3
     )
@@ -505,194 +558,311 @@ def print_vram():
 # TRAINING
 # ============================================================
 
-loader = batch_generator()
+print()
+print("=" * 70)
+print("STARTING TRAINING")
+print("=" * 70)
 
-model.train()
+print()
+print(
+    "Stateful linear attention: ENABLED"
+)
 
-states = None
+print(
+    "TBPTT: ENABLED"
+)
+
+print(
+    "Attention complexity: "
+    "chunked recurrent"
+)
+
+print(
+    "Persistent state: "
+    "8 attention states"
+)
+
+print()
+
+
+# ------------------------------------------------------------
+# One persistent state per repeated BDH layer.
+# ------------------------------------------------------------
+
+states = [
+    None
+    for _ in range(
+        NUM_LAYERS
+    )
+]
+
+
+# ------------------------------------------------------------
+# Global position for RoPE.
+#
+# This advances continuously while the temporal stream is
+# continuous.
+# ------------------------------------------------------------
 
 position_offset = 0
 
-start_time = time.perf_counter()
+start_time = time.time()
 
-last_log_time = (
-    start_time
-)
+last_position = stream_position
 
-print()
 
-print(
-    "=" * 72
-)
-
-print(
-    "STARTING TRAINING"
-)
-
-print(
-    "=" * 72
-)
-
-print()
-
-print(
-    "Dataset: TinyStories"
-)
-
-print(
-    "Encoding: raw UTF-8 bytes"
-)
-
-print(
-    "Architecture: BDH-GPU"
-)
-
-print(
-    f"Layers: {NUM_LAYERS}"
-)
-
-print(
-    f"Minibatch length: "
-    f"{SEQ_LEN} tokens"
-)
-
-print(
-    "Attention state: persistent"
-)
-
-print(
-    "Training: truncated BPTT"
-)
-
-print(
-    f"Total steps: "
-    f"{TOTAL_STEPS}"
-)
-
-print(
-    f"Warmup steps: "
-    f"{WARMUP_STEPS}"
-)
-
-print(
-    "-" * 72
-)
-
+# ============================================================
+# MAIN LOOP
+# ============================================================
 
 for step in range(
     1,
     TOTAL_STEPS + 1,
 ):
 
-    lr = set_lr(
+    # --------------------------------------------------------
+    # Detect stream wrap.
+    #
+    # If the dataset starts again, the previous temporal state
+    # is no longer meaningful.
+    # --------------------------------------------------------
+
+    if (
+        stream_position
+        < last_position
+    ):
+
+        states = [
+            None
+            for _ in range(
+                NUM_LAYERS
+            )
+        ]
+
+        position_offset = 0
+
+        print(
+            "\nDataset stream wrapped."
+        )
+
+        print(
+            "Persistent BDH state reset."
+        )
+
+    last_position = (
+        stream_position
+    )
+
+    # --------------------------------------------------------
+    # Batch
+    # --------------------------------------------------------
+
+    x, targets = get_batch()
+
+    # --------------------------------------------------------
+    # Learning rate
+    # --------------------------------------------------------
+
+    lr = get_learning_rate(
         step
     )
 
-    x, targets = next(
-        loader
+    set_learning_rate(
+        lr
     )
+
+    # --------------------------------------------------------
+    # Optimizer
+    # --------------------------------------------------------
 
     optimizer.zero_grad(
         set_to_none=True
     )
 
-    # --------------------------------------------------------
-    # FORWARD
-    # --------------------------------------------------------
+    try:
 
-    logits, states = model(
-        x,
-        states=states,
-        position_offset=position_offset,
-        debug=False,
-    )
+        # ====================================================
+        # FORWARD
+        # ====================================================
 
-    loss = F.cross_entropy(
-        logits.reshape(
-            -1,
-            logits.size(-1),
-        ),
-        targets.reshape(
-            -1
-        ),
-    )
-
-    if not torch.isfinite(
-        loss
-    ):
-
-        raise FloatingPointError(
-            f"Non-finite loss at "
-            f"step {step}: "
-            f"{loss.item()}"
+        logits, new_states = model(
+            x,
+            states=states,
+            position_offset=position_offset,
         )
 
-    # --------------------------------------------------------
-    # BACKWARD
-    # --------------------------------------------------------
+        # ====================================================
+        # LOSS
+        # ====================================================
 
-    loss.backward()
-
-    # --------------------------------------------------------
-    # GRADIENT CLIPPING
-    # --------------------------------------------------------
-
-    grad_norm = (
-        torch.nn.utils
-        .clip_grad_norm_(
-            model.parameters(),
-            max_norm=GRAD_CLIP,
-        )
-    )
-
-    if not torch.isfinite(
-        grad_norm
-    ):
-
-        raise FloatingPointError(
-            f"Non-finite gradient "
-            f"at step {step}"
+        loss = F.cross_entropy(
+            logits.reshape(
+                -1,
+                VOCAB_SIZE,
+            ),
+            targets.reshape(
+                -1
+            ),
         )
 
-    # --------------------------------------------------------
-    # OPTIMIZER
-    # --------------------------------------------------------
+        if not torch.isfinite(
+            loss
+        ):
 
-    optimizer.step()
-
-    # --------------------------------------------------------
-    # TBPTT
-    #
-    # Carry the state forward, but stop gradients from
-    # propagating indefinitely through previous minibatches.
-    # --------------------------------------------------------
-
-    states = detach_states(
-        states
-    )
-
-    position_offset += (
-        SEQ_LEN
-    )
-
-    # --------------------------------------------------------
-    # LOGGING
-    # --------------------------------------------------------
-
-    if step % PRINT_EVERY == 0:
-
-        now = time.perf_counter()
-
-        steps_per_sec = (
-            PRINT_EVERY
-            / max(
-                now
-                - last_log_time,
-                1e-9,
+            raise FloatingPointError(
+                f"Non-finite loss: "
+                f"{loss.item()}"
             )
+
+        # ====================================================
+        # BACKWARD
+        #
+        # Gradients flow through the current 2048-token
+        # minibatch.
+        # ====================================================
+
+        loss.backward()
+
+        # ====================================================
+        # GRADIENT CHECK
+        # ====================================================
+
+        (
+            grad_ok,
+            bad_name,
+            grad_norm,
+        ) = check_gradients()
+
+        if not grad_ok:
+
+            raise FloatingPointError(
+                "Non-finite gradient in "
+                f"{bad_name}"
+            )
+
+        # ====================================================
+        # GRADIENT CLIPPING
+        # ====================================================
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            GRAD_CLIP,
         )
 
-        last_log_time = now
+        # ====================================================
+        # OPTIMIZER
+        # ====================================================
+
+        optimizer.step()
+
+        # ====================================================
+        # PARAMETER CHECK
+        # ====================================================
+
+        (
+            params_ok,
+            bad_parameter,
+        ) = check_parameters()
+
+        if not params_ok:
+
+            raise FloatingPointError(
+                "Non-finite parameter: "
+                f"{bad_parameter}"
+            )
+
+        # ====================================================
+        # TBPTT
+        #
+        # IMPORTANT:
+        #
+        # We update the persistent state AFTER the optimizer
+        # step and detach it from the previous minibatch.
+        #
+        # This gives:
+        #
+        #     minibatch 1
+        #          |
+        #          v
+        #       state
+        #          |
+        #        detach
+        #          |
+        #          v
+        #     minibatch 2
+        #
+        # The model retains the state itself but does not
+        # backpropagate indefinitely through the entire corpus.
+        # ====================================================
+
+        states = [
+            state.detach()
+            for state in new_states
+        ]
+
+        # ----------------------------------------------------
+        # Advance global position.
+        # ----------------------------------------------------
+
+        position_offset += (
+            SEQ_LEN
+        )
+
+    except FloatingPointError as error:
+
+        print()
+        print("=" * 70)
+        print(
+            f"NUMERICAL ERROR AT STEP "
+            f"{step}"
+        )
+        print("=" * 70)
+
+        print(
+            str(error)
+        )
+
+        print_vram()
+
+        print()
+        print(
+            "Training stopped."
+        )
+
+        raise
+
+    except RuntimeError as error:
+
+        if (
+            "out of memory"
+            in str(error).lower()
+        ):
+
+            print()
+            print("=" * 70)
+            print(
+                f"CUDA OUT OF MEMORY "
+                f"AT STEP {step}"
+            )
+            print("=" * 70)
+
+            print_vram()
+
+            print()
+            print(
+                "Try reducing BATCH_SIZE."
+            )
+
+        raise
+
+    # ========================================================
+    # LOGGING
+    # ========================================================
+
+    if (
+        step % PRINT_EVERY
+        == 0
+    ):
 
         loss_value = (
             loss.item()
@@ -705,15 +875,22 @@ for step in range(
             )
         )
 
+        elapsed = (
+            time.time()
+            - start_time
+        )
+
+        steps_per_second = (
+            step / elapsed
+        )
+
         print(
             f"Step {step:5d} | "
             f"LR {lr:.7f} | "
             f"Loss {loss_value:.4f} | "
             f"PPL {perplexity:.2f} | "
-            f"GradNorm "
-            f"{grad_norm:.4f} | "
-            f"{steps_per_sec:.2f} "
-            f"step/s | ",
+            f"GradNorm {grad_norm:.4f} | "
+            f"{steps_per_second:.2f} step/s | ",
             end="",
         )
 
@@ -721,17 +898,29 @@ for step in range(
 
 
 # ============================================================
-# SAVE CHECKPOINT
+# FINAL CHECKPOINT
 # ============================================================
 
-elapsed_minutes = (
-    time.perf_counter()
-    - start_time
-) / 60.0
+params_ok, bad_parameter = (
+    check_parameters()
+)
 
+if not params_ok:
 
-torch.save(
-    {
+    print()
+    print(
+        "Model contains non-finite "
+        "parameters."
+    )
+
+    print(
+        "NO CHECKPOINT SAVED."
+    )
+
+else:
+
+    checkpoint = {
+
         "model_state_dict":
             model.state_dict(),
 
@@ -753,20 +942,20 @@ torch.save(
         "seq_len":
             SEQ_LEN,
 
+        "batch_size":
+            BATCH_SIZE,
+
         "vocab_size":
             VOCAB_SIZE,
 
-        "step":
-            TOTAL_STEPS,
+        "attention_block_size":
+            model.attn.block_size,
 
-        "dataset":
-            DATASET_NAME,
+        "learning_rate":
+            LEARNING_RATE,
 
-        "learning_rate_start":
-            LR_START,
-
-        "learning_rate_end":
-            LR_END,
+        "min_learning_rate":
+            MIN_LEARNING_RATE,
 
         "warmup_steps":
             WARMUP_STEPS,
@@ -774,74 +963,58 @@ torch.save(
         "weight_decay":
             WEIGHT_DECAY,
 
-        "batch_size":
-            BATCH_SIZE,
+        "step":
+            TOTAL_STEPS,
+
+        "dataset":
+            DATASET_NAME,
 
         "tbptt":
             True,
 
-        "persistent_attention_state":
+        "stateful_attention":
             True,
 
-        "training_precision":
-            "FP32",
-    },
-    SAVE_PATH,
-)
+        "position_offset":
+            position_offset,
+    }
 
+    torch.save(
+        checkpoint,
+        SAVE_PATH,
+    )
 
-print()
+    print()
+    print("=" * 70)
+    print("CHECKPOINT SAVED")
+    print("=" * 70)
 
-print(
-    "=" * 72
-)
+    print(
+        f"Path: "
+        f"{SAVE_PATH}"
+    )
 
-print(
-    "TRAINING COMPLETE"
-)
+    print(
+        f"Parameters: "
+        f"{parameter_count:,}"
+    )
 
-print(
-    "=" * 72
-)
+    print(
+        f"Steps: "
+        f"{TOTAL_STEPS:,}"
+    )
 
-print(
-    f"Checkpoint: "
-    f"{SAVE_PATH}"
-)
+    print(
+        f"Sequence length: "
+        f"{SEQ_LEN}"
+    )
 
-print(
-    f"Parameters: "
-    f"{count_parameters(model):,}"
-)
+    print(
+        "Persistent state: "
+        "YES"
+    )
 
-print(
-    f"Layers: "
-    f"{NUM_LAYERS}"
-)
-
-print(
-    f"Sequence length: "
-    f"{SEQ_LEN}"
-)
-
-print(
-    "Persistent attention state: True"
-)
-
-print(
-    "TBPTT: True"
-)
-
-print(
-    f"Steps: "
-    f"{TOTAL_STEPS}"
-)
-
-print(
-    f"Elapsed time: "
-    f"{elapsed_minutes:.2f} minutes"
-)
-
-print(
-    "=" * 72
-)
+    print(
+        "TBPTT: "
+        "YES"
+    )
