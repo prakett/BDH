@@ -11,10 +11,8 @@ from model import BDHModel
 # CONFIG
 # ============================================================
 
-CHECKPOINT = "bdh_model_paper_train_2.pt"
+CHECKPOINT = "bdh_tinystories_wikitext2_phase2.pt"
 
-# Fallback values.
-# Values stored inside the checkpoint will override these.
 N = 32768
 D = 256
 NUM_HEADS = 4
@@ -42,7 +40,7 @@ if DEVICE.type == "cuda":
     torch.backends.cudnn.allow_tf32 = True
 
 print("=" * 70)
-print("BDH-GPU EVALUATION")
+print("BDH CONTINUAL LEARNING - PHASE 1 EVALUATION")
 print("=" * 70)
 
 print(f"Device: {DEVICE}")
@@ -50,27 +48,26 @@ print(f"Device: {DEVICE}")
 if DEVICE.type == "cuda":
 
     print(
-        f"GPU: "
-        f"{torch.cuda.get_device_name(0)}"
+        f"GPU: {torch.cuda.get_device_name(0)}"
     )
 
     print(
-        f"CUDA: "
-        f"{torch.version.cuda}"
+        f"CUDA: {torch.version.cuda}"
     )
 
 
 # ============================================================
-# LOAD MODEL
+# LOAD CHECKPOINT
 # ============================================================
 
-print("\nLoading checkpoint...")
+print("\nLoading Phase 1 checkpoint...")
 
 checkpoint = torch.load(
     CHECKPOINT,
     map_location=DEVICE,
     weights_only=False,
 )
+
 
 if (
     isinstance(checkpoint, dict)
@@ -81,19 +78,8 @@ if (
         "model_state_dict"
     ]
 
-    # IMPORTANT:
-    # These names match the checkpoint produced
-    # by the 10k-step train.py.
-
-    N = checkpoint.get(
-        "n",
-        N,
-    )
-
-    D = checkpoint.get(
-        "d",
-        D,
-    )
+    N = checkpoint.get("n", N)
+    D = checkpoint.get("d", D)
 
     NUM_HEADS = checkpoint.get(
         "num_heads",
@@ -115,16 +101,41 @@ if (
         "unknown",
     )
 
-    print(
-        f"Checkpoint training step: "
-        f"{checkpoint_step}"
+    phase = checkpoint.get(
+        "phase",
+        "unknown",
+    )
+
+    dataset_name = checkpoint.get(
+        "dataset",
+        "unknown",
     )
 
 else:
 
     state_dict = checkpoint
-    checkpoint_step = "unknown"
 
+    checkpoint_step = "unknown"
+    phase = "unknown"
+    dataset_name = "unknown"
+
+
+print(
+    f"Checkpoint step: {checkpoint_step}"
+)
+
+print(
+    f"Training phase: {phase}"
+)
+
+print(
+    f"Training dataset: {dataset_name}"
+)
+
+
+# ============================================================
+# CREATE MODEL
+# ============================================================
 
 model = BDHModel(
     n=N,
@@ -134,6 +145,7 @@ model = BDHModel(
     dropout=DROPOUT,
     vocab_size=VOCAB_SIZE,
 ).to(DEVICE)
+
 
 model.load_state_dict(
     state_dict
@@ -152,7 +164,8 @@ parameters = sum(
     if p.requires_grad
 )
 
-print()
+print("\n" + "-" * 70)
+
 print(
     f"Parameters:      {parameters:,}"
 )
@@ -166,15 +179,15 @@ print(
 )
 
 print(
-    f"Heads:           {NUM_HEADS}"
+    f"Heads:            {NUM_HEADS}"
 )
 
 print(
-    f"Layers:          {NUM_LAYERS}"
+    f"Layers:           {NUM_LAYERS}"
 )
 
 print(
-    f"Sequence length: {SEQ_LEN}"
+    f"Sequence length:  {SEQ_LEN}"
 )
 
 
@@ -187,7 +200,8 @@ print(
 )
 
 dataset = load_dataset(
-    "roneneldan/TinyStories",
+    "Salesforce/wikitext",
+    "wikitext-2-raw-v1",
     split="validation",
 )
 
@@ -198,7 +212,7 @@ print(
 
 
 # ============================================================
-# CREATE VALIDATION STREAM
+# BUILD VALIDATION BYTE STREAM
 # ============================================================
 
 def build_validation_stream(dataset):
@@ -240,7 +254,7 @@ print(
 
 
 # ============================================================
-# MAKE VALIDATION BATCHES
+# CREATE VALIDATION BATCHES
 # ============================================================
 
 def get_validation_batch(position):
@@ -298,7 +312,7 @@ def get_validation_batch(position):
 # ============================================================
 
 print(
-    "\nRunning validation..."
+    "\nRunning TinyStories validation..."
 )
 
 print(
@@ -322,9 +336,6 @@ with torch.no_grad():
             )
         )
 
-        # IMPORTANT:
-        # The 10k-step model was trained in FP32.
-        # Therefore evaluation is also FP32.
         logits = model(x)
 
         loss = F.cross_entropy(
@@ -346,7 +357,8 @@ with torch.no_grad():
         tokens = targets.numel()
 
         total_loss += (
-            loss.item() * tokens
+            loss.item()
+            * tokens
         )
 
         total_tokens += tokens
@@ -374,6 +386,10 @@ with torch.no_grad():
             )
 
 
+# ============================================================
+# FINAL RESULTS
+# ============================================================
+
 average_loss = (
     total_loss
     / total_tokens
@@ -387,22 +403,9 @@ perplexity = math.exp(
 )
 
 
-# ============================================================
-# VALIDATION RESULTS
-# ============================================================
-
-print(
-    "\n"
-    + "=" * 70
-)
-
-print(
-    "VALIDATION RESULTS"
-)
-
-print(
-    "=" * 70
-)
+print("\n" + "=" * 70)
+print("PHASE 1 VALIDATION RESULTS")
+print("=" * 70)
 
 print(
     f"Checkpoint step:       "
@@ -433,7 +436,6 @@ def generate(
 
     model.eval()
 
-    # Raw UTF-8 bytes.
     generated = list(
         prompt.encode("utf-8")
     )
@@ -444,7 +446,7 @@ def generate(
             max_new_bytes
         ):
 
-            # Keep only the most recent context.
+            # Keep most recent context.
             context = generated[
                 -SEQ_LEN:
             ]
@@ -455,8 +457,6 @@ def generate(
                 device=DEVICE,
             )
 
-            # FP32 generation.
-            # This matches the training run.
             logits = model(x)
 
             # Last-token prediction.
@@ -528,33 +528,21 @@ def generate(
                 next_byte
             )
 
-    # Decode bytes.
-    output = bytes(
+    return bytes(
         generated
     ).decode(
         "utf-8",
         errors="replace",
     )
 
-    return output
-
 
 # ============================================================
 # GENERATION TESTS
 # ============================================================
 
-print(
-    "\n"
-    + "=" * 70
-)
-
-print(
-    "TEXT GENERATION"
-)
-
-print(
-    "=" * 70
-)
+print("\n" + "=" * 70)
+print("PHASE 1 TEXT GENERATION")
+print("=" * 70)
 
 prompts = [
     "Once upon a time",
@@ -612,13 +600,9 @@ if DEVICE.type == "cuda":
         + "=" * 70
     )
 
-    print(
-        "GPU MEMORY"
-    )
+    print("GPU MEMORY")
 
-    print(
-        "=" * 70
-    )
+    print("=" * 70)
 
     print(
         f"Allocated: "

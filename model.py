@@ -6,60 +6,95 @@ import torch.nn.functional as F
 
 
 # ============================================================
-# DEFAULT CONFIGURATION
+# BDH-GPU CONFIGURATION
 # ============================================================
 
 N = 32768
 D = 256
+
 NUM_HEADS = 4
 NUM_LAYERS = 8
+
 DROPOUT = 0.10
+
 VOCAB_SIZE = 256
 
+# ------------------------------------------------------------
+# This is NOT an architectural parameter.
+#
+# It only controls how the recurrent linear-attention
+# computation is evaluated efficiently on the GPU.
+#
+# Smaller = smaller local attention matrices.
+# Larger  = fewer GPU blocks.
+# ------------------------------------------------------------
+
+ATTENTION_BLOCK_SIZE = 256
+
 
 # ============================================================
-# RoPE
+# ROPE
 # ============================================================
 
-def apply_rope(x, positions):
+def apply_rope(
+    x,
+    position_offset=0,
+):
     """
-    Apply RoPE along the neuron/head dimension.
+    Apply rotary positional encoding.
 
-    x:
+    Input:
+        x: [B, H, T, Dh]
+
+    Output:
         [B, H, T, Dh]
 
-    positions:
-        [T]
-
-    Returns:
-        [B, H, T, Dh]
+    position_offset allows RoPE positions to continue across
+    successive TBPTT minibatches.
     """
 
     B, H, T, Dh = x.shape
 
     if Dh % 2 != 0:
         raise ValueError(
-            f"RoPE requires an even dimension, got {Dh}"
+            "RoPE requires an even head dimension."
         )
 
     device = x.device
     dtype = x.dtype
 
-    half = Dh // 2
+    half_dim = Dh // 2
 
-    inv_freq = 1.0 / (
-        10000.0 ** (
-            torch.arange(
-                0,
-                half,
-                device=device,
-                dtype=torch.float32,
+    # --------------------------------------------------------
+    # Standard RoPE inverse frequencies
+    # --------------------------------------------------------
+
+    inv_freq = (
+        1.0
+        / (
+            10000.0
+            ** (
+                torch.arange(
+                    0,
+                    half_dim,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                / half_dim
             )
-            / half
         )
     )
 
-    positions = positions.to(
+    # --------------------------------------------------------
+    # Global positions.
+    #
+    # position_offset is important when the recurrent state
+    # is carried across minibatches.
+    # --------------------------------------------------------
+
+    positions = torch.arange(
+        position_offset,
+        position_offset + T,
         device=device,
         dtype=torch.float32,
     )
@@ -69,22 +104,26 @@ def apply_rope(x, positions):
         inv_freq,
     )
 
-    cos = torch.cos(angles).to(dtype)
-    sin = torch.sin(angles).to(dtype)
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+
+    # [T, Dh/2] -> [1, 1, T, Dh/2]
 
     cos = cos.unsqueeze(0).unsqueeze(0)
     sin = sin.unsqueeze(0).unsqueeze(0)
 
-    x1 = x[..., :half]
-    x2 = x[..., half:]
+    x1 = x[..., :half_dim]
+    x2 = x[..., half_dim:]
 
-    return torch.cat(
+    rotated = torch.cat(
         [
             x1 * cos - x2 * sin,
             x1 * sin + x2 * cos,
         ],
         dim=-1,
     )
+
+    return rotated
 
 
 # ============================================================
@@ -93,8 +132,13 @@ def apply_rope(x, positions):
 
 class LinearAttention(nn.Module):
 
-    def __init__(self):
+    def __init__(
+        self,
+        block_size=ATTENTION_BLOCK_SIZE,
+    ):
         super().__init__()
+
+        self.block_size = block_size
 
     def forward(
         self,
@@ -102,7 +146,7 @@ class LinearAttention(nn.Module):
         K,
         V,
         state=None,
-        positions=None,
+        position_offset=0,
     ):
         """
         Stateful causal linear attention.
@@ -114,32 +158,59 @@ class LinearAttention(nn.Module):
             [B, H, T, Dh]
 
         V:
-            [B, H, T, D]
+            [B, 1, T, D]
 
-        state:
+        State:
             [B, H, Dh, D]
 
-        Returns:
-            output:
-                [B, H, T, D]
+        Mathematical recurrence:
 
-            new_state:
-                [B, H, Dh, D]
+            S_t = S_{t-1} + K_t^T V_t
+
+            a_t = Q_t S_{t-1}
+
+        with RoPE applied to Q and K.
+
+        The computation is evaluated in blocks so that we
+        never materialize a T x T matrix for T=2048.
         """
+
+        B, H, T, Dh = Q.shape
+
+        # ----------------------------------------------------
+        # Attention is deliberately computed in FP32.
+        #
+        # This is important because BDH's raw linear attention
+        # is not softmax-normalized.
+        # ----------------------------------------------------
 
         Q = Q.float()
         K = K.float()
         V = V.float()
 
-        B, H, T, Dh = Q.shape
-        Dv = V.size(-1)
+        # ----------------------------------------------------
+        # V comes from v_ast:
+        #
+        # [B, 1, T, D]
+        #
+        # Broadcast it across attention heads.
+        # ----------------------------------------------------
 
-        if positions is None:
-            positions = torch.arange(
+        if V.size(1) == 1 and H != 1:
+            V = V.expand(
+                B,
+                H,
                 T,
-                device=Q.device,
-                dtype=torch.long,
+                V.size(-1),
             )
+
+        elif V.size(1) != H:
+            raise ValueError(
+                "V must have either one head or the same "
+                "number of heads as Q/K."
+            )
+
+        value_dim = V.size(-1)
 
         # ----------------------------------------------------
         # RoPE
@@ -147,19 +218,21 @@ class LinearAttention(nn.Module):
 
         Qr = apply_rope(
             Q,
-            positions,
+            position_offset=position_offset,
         )
 
         Kr = apply_rope(
             K,
-            positions,
+            position_offset=position_offset,
         )
 
         # ----------------------------------------------------
-        # Previous recurrent state
+        # Initialize persistent recurrent state.
         #
-        # state =
-        # sum(previous K_r^T @ V)
+        # S = sum(K^T V)
+        #
+        # Shape:
+        # [B, H, Dh, D]
         # ----------------------------------------------------
 
         if state is None:
@@ -168,66 +241,163 @@ class LinearAttention(nn.Module):
                 B,
                 H,
                 Dh,
-                Dv,
+                value_dim,
                 device=Q.device,
                 dtype=torch.float32,
             )
 
         else:
 
+            if state.shape != (
+                B,
+                H,
+                Dh,
+                value_dim,
+            ):
+                raise ValueError(
+                    "Invalid attention state shape. "
+                    f"Expected {(B, H, Dh, value_dim)}, "
+                    f"got {tuple(state.shape)}."
+                )
+
             state = state.float()
 
         # ----------------------------------------------------
-        # Contribution from previous minibatches
+        # Output blocks
         # ----------------------------------------------------
 
-        previous_output = (
-            Qr @ state
-        )
+        outputs = []
+
+        block_size = self.block_size
+
+        for start in range(
+            0,
+            T,
+            block_size,
+        ):
+
+            end = min(
+                start + block_size,
+                T,
+            )
+
+            Q_block = Qr[
+                :,
+                :,
+                start:end,
+                :,
+            ]
+
+            K_block = Kr[
+                :,
+                :,
+                start:end,
+                :,
+            ]
+
+            V_block = V[
+                :,
+                :,
+                start:end,
+                :,
+            ]
+
+            block_T = end - start
+
+            # =================================================
+            # 1. Interaction with ALL previous minibatches and
+            #    previous blocks.
+            #
+            #     Q_block @ state
+            #
+            # This is the recurrent/state-space component.
+            # =================================================
+
+            previous_output = torch.matmul(
+                Q_block,
+                state,
+            )
+
+            # =================================================
+            # 2. Causal interaction WITHIN the current block.
+            #
+            # This is only block_size x block_size.
+            #
+            # It is mathematically equivalent to:
+            #
+            #     tril(Q K^T, diagonal=-1) V
+            #
+            # but we never create a 2048 x 2048 matrix.
+            # =================================================
+
+            local_scores = torch.matmul(
+                Q_block,
+                K_block.transpose(
+                    -1,
+                    -2,
+                ),
+            )
+
+            causal_mask = torch.tril(
+                torch.ones(
+                    block_T,
+                    block_T,
+                    device=Q.device,
+                    dtype=torch.bool,
+                ),
+                diagonal=-1,
+            )
+
+            local_scores = local_scores.masked_fill(
+                ~causal_mask,
+                0.0,
+            )
+
+            local_output = torch.matmul(
+                local_scores,
+                V_block,
+            )
+
+            # =================================================
+            # Total causal attention output
+            # =================================================
+
+            output_block = (
+                previous_output
+                + local_output
+            )
+
+            outputs.append(
+                output_block
+            )
+
+            # =================================================
+            # 3. Update recurrent state AFTER the block.
+            #
+            #     S <- S + K^T V
+            #
+            # This means the current token/block cannot attend
+            # to itself through the persistent state.
+            # =================================================
+
+            state = state + torch.matmul(
+                K_block.transpose(
+                    -1,
+                    -2,
+                ),
+                V_block,
+            )
 
         # ----------------------------------------------------
-        # Causal attention INSIDE current minibatch
-        #
-        # Important:
-        # diagonal=-1 excludes current token.
+        # Combine blocks
         # ----------------------------------------------------
 
-        scores = (
-            Qr
-            @ Kr.transpose(-1, -2)
+        output = torch.cat(
+            outputs,
+            dim=2,
         )
 
-        scores = torch.tril(
-            scores,
-            diagonal=-1,
-        )
-
-        local_output = (
-            scores @ V
-        )
-
-        output = (
-            previous_output
-            + local_output
-        )
-
-        # ----------------------------------------------------
-        # Update recurrent state AFTER producing outputs.
-        #
-        # Therefore the current token cannot attend to itself.
-        # ----------------------------------------------------
-
-        current_state = (
-            Kr.transpose(-1, -2)
-            @ V
-        )
-
-        new_state = (
-            state
-            + current_state
-        )
-
-        return output, new_state
+        return output, state
 
 
 # ============================================================
@@ -244,8 +414,8 @@ class BDHModel(nn.Module):
         num_layers=NUM_LAYERS,
         dropout=DROPOUT,
         vocab_size=VOCAB_SIZE,
+        attention_block_size=ATTENTION_BLOCK_SIZE,
     ):
-
         super().__init__()
 
         if n % num_heads != 0:
@@ -254,12 +424,22 @@ class BDHModel(nn.Module):
                 f"num_heads={num_heads}"
             )
 
+        if d % num_heads != 0:
+            raise ValueError(
+                f"D={d} must be divisible by "
+                f"num_heads={num_heads}"
+            )
+
         self.n = n
         self.d = d
+
         self.num_heads = num_heads
         self.num_layers = num_layers
+
         self.dropout_rate = dropout
         self.vocab_size = vocab_size
+
+        self.head_dim = d // num_heads
 
         # ----------------------------------------------------
         # LayerNorm
@@ -285,10 +465,10 @@ class BDHModel(nn.Module):
         )
 
         # ----------------------------------------------------
-        # BDH parameters
+        # BDH-GPU parameters
         #
-        # Same parameters are reused through all L layers,
-        # matching the Appendix-E style architecture.
+        # These parameters are SHARED across the 8 repeated
+        # BDH layers, as in the Appendix-E implementation.
         # ----------------------------------------------------
 
         self.encoder = nn.Parameter(
@@ -334,63 +514,15 @@ class BDHModel(nn.Module):
         )
 
         # ----------------------------------------------------
-        # Stateful attention
+        # Stateful linear attention
         # ----------------------------------------------------
 
-        self.attn = LinearAttention()
+        self.attn = LinearAttention(
+            block_size=attention_block_size,
+        )
 
     # ========================================================
-    # FINITE CHECK
-    # ========================================================
-
-    @staticmethod
-    def check_finite(
-        x,
-        name,
-    ):
-
-        if not torch.isfinite(
-            x
-        ).all():
-
-            finite_ratio = (
-                torch.isfinite(x)
-                .float()
-                .mean()
-                .item()
-            )
-
-            finite_values = (
-                x.detach()
-                .float()
-                .abs()
-            )
-
-            finite_values = (
-                finite_values[
-                    torch.isfinite(
-                        finite_values
-                    )
-                ]
-            )
-
-            if finite_values.numel() > 0:
-                max_value = (
-                    finite_values.max()
-                    .item()
-                )
-            else:
-                max_value = float("nan")
-
-            raise FloatingPointError(
-                f"Non-finite tensor detected: "
-                f"{name} | "
-                f"finite={finite_ratio:.6f} | "
-                f"max_abs={max_value:.6e}"
-            )
-
-    # ========================================================
-    # FORWARD
+    # Forward
     # ========================================================
 
     def forward(
@@ -400,54 +532,27 @@ class BDHModel(nn.Module):
         position_offset=0,
         debug=False,
     ):
+        """
+        idx:
+            [B, T]
+
+        states:
+            list containing one recurrent attention state
+            for every repeated BDH layer.
+
+        Returns:
+
+            logits:
+                [B, T, vocab_size]
+
+            new_states:
+                list of updated recurrent states
+        """
 
         B, T = idx.size()
 
         # ----------------------------------------------------
-        # Position indices
-        # ----------------------------------------------------
-
-        positions = (
-            torch.arange(
-                position_offset,
-                position_offset + T,
-                device=idx.device,
-                dtype=torch.long,
-            )
-        )
-
-        # ----------------------------------------------------
-        # Embedding
-        # ----------------------------------------------------
-
-        v_ast = self.wte(
-            idx
-        )
-
-        if debug:
-            self.check_finite(
-                v_ast,
-                "embedding",
-            )
-
-        # [B, 1, T, D]
-
-        v_ast = (
-            v_ast.unsqueeze(1)
-        )
-
-        v_ast = self.ln(
-            v_ast
-        )
-
-        if debug:
-            self.check_finite(
-                v_ast,
-                "initial_layernorm",
-            )
-
-        # ----------------------------------------------------
-        # Initialize states
+        # Initialize states for all 8 layers.
         # ----------------------------------------------------
 
         if states is None:
@@ -460,14 +565,28 @@ class BDHModel(nn.Module):
             ]
 
         if len(states) != self.num_layers:
-
             raise ValueError(
-                f"Expected "
-                f"{self.num_layers} states, "
-                f"got {len(states)}"
+                f"Expected {self.num_layers} states, "
+                f"got {len(states)}."
             )
 
         new_states = []
+
+        # ----------------------------------------------------
+        # Token embedding
+        # ----------------------------------------------------
+
+        v_ast = self.wte(
+            idx
+        )
+
+        # [B, T, D]
+        v_ast = self.ln(
+            v_ast
+        )
+
+        # [B, 1, T, D]
+        v_ast = v_ast.unsqueeze(1)
 
         # ----------------------------------------------------
         # BDH layers
@@ -477,66 +596,56 @@ class BDHModel(nn.Module):
             self.num_layers
         ):
 
-            # ------------------------------------------------
+            # =================================================
             # X projection
-            # ------------------------------------------------
+            #
+            # [B,1,T,D]
+            #
+            # ->
+            #
+            # [B,H,T,N/H]
+            # =================================================
 
             x = torch.matmul(
                 v_ast,
                 self.decoder_x,
             )
 
-            if debug:
-                self.check_finite(
-                    x,
-                    f"layer_{layer_idx}_decoder_x",
-                )
-
             x = F.relu(
                 x
             )
 
-            if debug:
-                self.check_finite(
-                    x,
-                    f"layer_{layer_idx}_relu_x",
-                )
+            # =================================================
+            # Stateful causal linear attention
+            # =================================================
 
-            # ------------------------------------------------
-            # Stateful linear attention
-            # ------------------------------------------------
-
-            a_ast, new_state = (
-                self.attn(
-                    Q=x,
-                    K=x,
-                    V=v_ast,
-                    state=states[layer_idx],
-                    positions=positions,
-                )
+            a_ast, layer_state = self.attn(
+                Q=x,
+                K=x,
+                V=v_ast,
+                state=states[layer_idx],
+                position_offset=position_offset,
             )
 
-            if debug:
-                self.check_finite(
-                    a_ast,
-                    f"layer_{layer_idx}_attention",
-                )
-
-                self.check_finite(
-                    new_state,
-                    f"layer_{layer_idx}_state",
-                )
-
+            # Keep state in FP32.
             new_states.append(
-                new_state
+                layer_state
             )
 
-            # ------------------------------------------------
+            # =================================================
+            # Attention normalization
+            # =================================================
+
+            a_ast = self.ln(
+                a_ast
+            )
+
+            # =================================================
             # Y projection
-            # ------------------------------------------------
+            # =================================================
 
             y = torch.matmul(
-                self.ln(a_ast),
+                a_ast,
                 self.decoder_y,
             )
 
@@ -544,59 +653,53 @@ class BDHModel(nn.Module):
                 y
             )
 
-            if debug:
-                self.check_finite(
-                    y,
-                    f"layer_{layer_idx}_relu_y",
-                )
-
-            # ------------------------------------------------
+            # =================================================
             # Multiplicative interaction
-            # ------------------------------------------------
+            # =================================================
 
             y = y * x
 
-            if debug:
-                self.check_finite(
-                    y,
-                    f"layer_{layer_idx}_y_times_x",
-                )
+            # =================================================
+            # Reshape back to N dimension
+            # =================================================
 
-            # ------------------------------------------------
-            # [B,H,T,N/H]
-            # ->
-            # [B,1,T,N]
-            # ------------------------------------------------
-
-            y = (
-                y.transpose(
-                    1,
-                    2,
-                )
-                .reshape(
-                    B,
-                    1,
-                    T,
-                    self.n,
-                )
+            y = y.transpose(
+                1,
+                2,
             )
 
-            # ------------------------------------------------
+            y = y.reshape(
+                B,
+                1,
+                T,
+                self.n,
+            )
+
+            # =================================================
             # Dropout
-            # ------------------------------------------------
+            # =================================================
 
             y = self.drop(
                 y
             )
 
-            # ------------------------------------------------
+            # =================================================
             # Encoder
-            # ------------------------------------------------
+            # =================================================
+
+            update = torch.matmul(
+                y,
+                self.encoder,
+            )
+
+            # =================================================
+            # Residual update
+            # =================================================
 
             v_ast = (
                 v_ast
                 + self.ln(
-                    y @ self.encoder
+                    update
                 )
             )
 
@@ -604,31 +707,20 @@ class BDHModel(nn.Module):
                 v_ast
             )
 
-            if debug:
-                self.check_finite(
-                    v_ast,
-                    f"layer_{layer_idx}_output",
-                )
-
         # ----------------------------------------------------
         # Readout
         # ----------------------------------------------------
 
-        logits = (
-            v_ast.squeeze(1)
-            @ self.readout
+        hidden = v_ast.squeeze(
+            1
         )
 
-        if debug:
-            self.check_finite(
-                logits,
-                "logits",
-            )
-
-        return (
-            logits,
-            new_states,
+        logits = torch.matmul(
+            hidden,
+            self.readout,
         )
+
+        return logits, new_states
 
 
 # ============================================================
@@ -636,9 +728,8 @@ class BDHModel(nn.Module):
 # ============================================================
 
 def count_parameters(
-    model,
+    model
 ):
-
     return sum(
         p.numel()
         for p in model.parameters()
@@ -647,12 +738,12 @@ def count_parameters(
 
 
 # ============================================================
-# QUICK TEST
+# TEST
 # ============================================================
 
 if __name__ == "__main__":
 
-    device = torch.device(
+    device = (
         "cuda"
         if torch.cuda.is_available()
         else "cpu"
@@ -662,10 +753,43 @@ if __name__ == "__main__":
         device
     )
 
+    print("=" * 70)
+    print("BDH-GPU MODEL")
+    print("=" * 70)
+
     print(
-        f"Parameters: "
+        f"N:                 {model.n}"
+    )
+
+    print(
+        f"D:                 {model.d}"
+    )
+
+    print(
+        f"Heads:              {model.num_heads}"
+    )
+
+    print(
+        f"Layers:             {model.num_layers}"
+    )
+
+    print(
+        f"Head dimension:     {model.head_dim}"
+    )
+
+    print(
+        f"Attention block:    "
+        f"{model.attn.block_size}"
+    )
+
+    print(
+        f"Parameters:         "
         f"{count_parameters(model):,}"
     )
+
+    # --------------------------------------------------------
+    # Small forward test
+    # --------------------------------------------------------
 
     x = torch.randint(
         0,
@@ -680,17 +804,29 @@ if __name__ == "__main__":
     with torch.no_grad():
 
         logits, states = model(
-            x
+            x,
+            states=None,
+            position_offset=0,
         )
 
     print(
-        f"Input:  {x.shape}"
+        f"Input shape:        "
+        f"{tuple(x.shape)}"
     )
 
     print(
-        f"Logits: {logits.shape}"
+        f"Logits shape:       "
+        f"{tuple(logits.shape)}"
     )
 
     print(
-        f"States: {len(states)}"
+        f"Number of states:   "
+        f"{len(states)}"
     )
+
+    print(
+        f"State shape:        "
+        f"{tuple(states[0].shape)}"
+    )
+
+    print("=" * 70)
