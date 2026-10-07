@@ -24,7 +24,7 @@ NUM_LAYERS = 6
 DROPOUT = 0.10
 VOCAB_SIZE = 256
 
-SEQ_LEN = 512
+SEQ_LEN = 1024
 BATCH_SIZE = 2             # Per GPU: global batch = 4
 
 TOTAL_STEPS = 10000
