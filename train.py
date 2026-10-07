@@ -15,11 +15,11 @@ from model import (
 # CONFIGURATION
 # ============================================================
 
-N = 32768
+N = 16384
 D = 256
 
 NUM_HEADS = 4
-NUM_LAYERS = 8
+NUM_LAYERS = 6
 
 DROPOUT = 0.10
 
@@ -29,7 +29,7 @@ VOCAB_SIZE = 256
 # Paper scaling setup
 # ------------------------------------------------------------
 
-SEQ_LEN = 2048
+SEQ_LEN = 1024
 
 # 1 example x 2048 tokens.
 #
@@ -39,7 +39,7 @@ SEQ_LEN = 2048
 # The recurrent state is carried across minibatches.
 # ------------------------------------------------------------
 
-BATCH_SIZE = 1
+BATCH_SIZE = 4
 
 TOTAL_STEPS = 10000
 

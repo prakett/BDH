@@ -9,11 +9,11 @@ import torch.nn.functional as F
 # BDH-GPU CONFIGURATION
 # ============================================================
 
-N = 32768
+N = 16384
 D = 256
 
 NUM_HEADS = 4
-NUM_LAYERS = 8
+NUM_LAYERS = 6
 
 DROPOUT = 0.10
 
